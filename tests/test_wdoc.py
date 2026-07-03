@@ -698,3 +698,236 @@ def test_query_duckduckgo_search():
     assert isinstance(out["final_answer"], str), out
     assert len(out["final_answer"]) > 0, out
     # Don't check the content deeply as requested, just ensure it returns something
+
+
+@pytest.mark.basic
+def test_load_one_doc_error_message_is_concise():
+    """A failing document load must log ONE concise error line, not the error
+    text stapled to a full traceback. The wrapper used to embed the traceback in
+    the message AND re-emit it via logger.exception AND again via the re-raise,
+    stacking three near-identical tracebacks that buried the real error (e.g. a
+    single '415 Unsupported Media Type' from a whisper endpoint). Regression test
+    for that noisy/misleading output."""
+    from loguru import logger
+    from wdoc.utils.loaders import wrapper_load_one_doc
+
+    @wrapper_load_one_doc
+    def _boom(**kwargs):
+        raise ValueError("415 Unsupported Media Type")
+
+    records = []
+    sink_id = logger.add(lambda m: records.append(m.record), level="DEBUG")
+    try:
+        # warn mode swallows the error and returns its string
+        ret = _boom(filetype="local_audio", loading_failure="warn")
+        assert ret == "415 Unsupported Media Type"
+
+        # crash mode re-raises the original exception
+        with pytest.raises(ValueError, match="415 Unsupported Media Type"):
+            _boom(filetype="local_audio", loading_failure="crash")
+    finally:
+        logger.remove(sink_id)
+
+    wrapper_records = [r for r in records if "Error when loading doc" in r["message"]]
+    assert len(wrapper_records) == 2, wrapper_records
+
+    for rec in wrapper_records:
+        # the message itself stays concise: no embedded traceback dump
+        assert "Full traceback:" not in rec["message"], rec["message"]
+        assert "415 Unsupported Media Type" in rec["message"], rec["message"]
+        assert "filetype local_audio" in rec["message"], rec["message"]
+
+    warn_rec = next(r for r in wrapper_records if r["level"].name == "WARNING")
+    crash_rec = next(r for r in wrapper_records if r["level"].name == "ERROR")
+
+    # crash mode leaves the traceback to the re-raise instead of duplicating it
+    # onto the log record
+    assert crash_rec["exception"] is None, crash_rec["exception"]
+    # warn mode keeps the traceback attached exactly once (via exc_info), not
+    # inlined into the message
+    assert warn_rec["exception"] is not None
+
+
+@pytest.mark.basic
+def test_whisper_fallback_rewinds_file(tmp_path, monkeypatch):
+    """When litellm.transcription fails and wdoc falls back to a direct request,
+    it must rewind the audio file first. litellm reads the handle to EOF, so
+    without a seek(0) the fallback uploads an empty body and the endpoint answers
+    with a misleading error (e.g. 415 Unsupported Media Type) unrelated to the
+    real failure. Regression test: the fallback must upload the full file."""
+    import litellm
+    import requests
+
+    from wdoc.utils.loaders import shared_audio
+
+    monkeypatch.setenv("WDOC_WHISPER_API_KEY", "test-key")
+    monkeypatch.setenv("WDOC_WHISPER_ENDPOINT", "https://fake.endpoint/")
+
+    audio_path = tmp_path / "sample.mp3"
+    payload = b"FAKE_AUDIO_BYTES_0123456789"
+    audio_path.write_bytes(payload)
+
+    def fake_transcription(**kwargs):
+        # emulate litellm consuming the file to EOF before failing
+        kwargs["file"].read()
+        raise RuntimeError("litellm boom")
+
+    uploaded = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"text": "ok"}
+
+    def fake_post(url, files=None, data=None, headers=None):
+        uploaded["content"] = files["file"].read()
+        return FakeResponse()
+
+    monkeypatch.setattr(litellm, "transcription", fake_transcription)
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    # call the undecorated function to bypass the joblib disk cache, so the test
+    # actually exercises the code and stays reproducible across runs
+    out = shared_audio.transcribe_audio_whisper.func(
+        audio_path=audio_path,
+        audio_hash="rewind-hash",
+        language=None,
+        prompt=None,
+    )
+
+    assert out == {"text": "ok"}
+    # the crux: the fallback uploaded the whole file, not the empty EOF leftover
+    assert uploaded["content"] == payload
+
+
+@pytest.mark.basic
+def test_whisper_fallback_surfaces_both_errors(tmp_path, monkeypatch):
+    """If the direct-request fallback also fails, the raised error must mention
+    BOTH the endpoint error and the original litellm error, so the real root
+    cause (often an auth/proxy misconfiguration) is not masked by a spurious
+    status code."""
+    import litellm
+    import requests
+
+    from wdoc.utils.loaders import shared_audio
+
+    monkeypatch.setenv("WDOC_WHISPER_API_KEY", "test-key")
+    monkeypatch.setenv("WDOC_WHISPER_ENDPOINT", "https://fake.endpoint/")
+
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"FAKE_AUDIO_BYTES_0123456789")
+
+    def fake_transcription(**kwargs):
+        kwargs["file"].read()
+        raise RuntimeError("original litellm auth failure")
+
+    def fake_post(url, files=None, data=None, headers=None):
+        raise requests.exceptions.HTTPError("415 Unsupported Media Type")
+
+    monkeypatch.setattr(litellm, "transcription", fake_transcription)
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    # call the undecorated function to bypass the joblib disk cache
+    with pytest.raises(Exception) as excinfo:
+        shared_audio.transcribe_audio_whisper.func(
+            audio_path=audio_path,
+            audio_hash="both-errors-hash",
+            language=None,
+            prompt=None,
+        )
+
+    msg = str(excinfo.value)
+    assert "415 Unsupported Media Type" in msg
+    assert "original litellm auth failure" in msg
+
+
+@pytest.mark.basic
+def test_local_audio_unsilence_uploads_mp3_not_ogg(tmp_path, monkeypatch):
+    """The silence-removal path must hand a widely-supported format to the
+    transcriber. It used to re-encode to .ogg, which some OpenAI-compatible
+    whisper endpoints reject with a 415 Unsupported Media Type. Regression test:
+    the file passed to transcribe_audio_whisper must be .mp3 (matching the video
+    and online-media loaders), never .ogg."""
+    import types
+    import uuid
+    from pathlib import Path
+
+    from wdoc.utils.loaders import local_audio
+
+    # a fake waveform whose only meaningful attribute is its sample count
+    class FakeWave:
+        def __init__(self, nsamples):
+            self.shape = (1, nsamples)
+
+    sample_rate = 16000
+    # 20s of audio -> 15s after "silence removal": passes the >10s and
+    # new_dur <= dur assertions in the loader. raising=False because torchaudio
+    # exposes some of these (e.g. sox_effects) only after a lazy submodule import.
+    monkeypatch.setattr(
+        local_audio.torchaudio,
+        "load",
+        lambda *a, **k: (FakeWave(20 * sample_rate), sample_rate),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        local_audio.torchaudio,
+        "sox_effects",
+        types.SimpleNamespace(
+            apply_effects_tensor=lambda *a, **k: (
+                FakeWave(15 * sample_rate),
+                sample_rate,
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        local_audio.torchaudio, "save", lambda *a, **k: None, raising=False
+    )
+
+    # no-op ffmpeg chain: ffmpeg.input(...).output(...).run()
+    class _Chain:
+        def output(self, *a, **k):
+            return self
+
+        def run(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(local_audio.ffmpeg, "input", lambda *a, **k: _Chain())
+    monkeypatch.setattr(local_audio, "file_hasher", lambda *a, **k: "fakehash")
+
+    captured = {}
+
+    def fake_transcribe(audio_path, audio_hash, language, prompt):
+        captured["audio_path"] = Path(audio_path)
+        return {
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
+            "duration": 15.0,
+            "language": "en",
+        }
+
+    monkeypatch.setattr(local_audio, "transcribe_audio_whisper", fake_transcribe)
+    monkeypatch.setattr(
+        local_audio,
+        "convert_verbose_json_to_timestamped_text",
+        lambda content: "hello",
+    )
+
+    audio_in = tmp_path / "input.wav"
+    audio_in.write_bytes(b"not-really-audio")
+
+    docs = local_audio.load_local_audio(
+        path=audio_in,
+        # unique hash so the joblib doc-loaders cache always misses (reproducible)
+        file_hash=uuid.uuid4().hex,
+        audio_backend="whisper",
+        loaders_temp_dir=tmp_path,
+        audio_unsilence=True,
+    )
+
+    assert "audio_path" in captured, "transcribe_audio_whisper was never called"
+    assert captured["audio_path"].suffix == ".mp3", captured["audio_path"]
+    assert captured["audio_path"].suffix != ".ogg"
+    assert len(docs) == 1
+    assert docs[0].page_content == "hello"

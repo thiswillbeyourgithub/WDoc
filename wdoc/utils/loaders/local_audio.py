@@ -114,24 +114,29 @@ def load_local_audio(
         )
 
         unsilenced_path_wav = loaders_temp_dir / f"unsilenced_audio_{uuid6.uuid6()}.wav"
-        unsilenced_path_ogg = loaders_temp_dir / f"unsilenced_audio_{uuid6.uuid6()}.ogg"
+        # mp3 is used for the transcription upload because it is the most widely
+        # supported format across whisper endpoints. ogg was previously used but
+        # some OpenAI-compatible servers reject it with a 415 Unsupported Media
+        # Type. This also matches local_video.py and online_media.py, which both
+        # extract audio as mp3.
+        unsilenced_path_mp3 = loaders_temp_dir / f"unsilenced_audio_{uuid6.uuid6()}.mp3"
         assert not unsilenced_path_wav.exists()
-        assert not unsilenced_path_ogg.exists()
+        assert not unsilenced_path_mp3.exists()
         torchaudio.save(
             uri=str(unsilenced_path_wav.resolve().absolute()),
             src=waveform,
             sample_rate=sample_rate,
             format="wav",
         )
-        # turn the .wav into .ogg
+        # turn the .wav into .mp3
         ffmpeg.input(str(unsilenced_path_wav.resolve().absolute())).output(
-            str(unsilenced_path_ogg.resolve().absolute())
+            str(unsilenced_path_mp3.resolve().absolute())
         ).run()
-        unsilenced_hash = file_hasher({"path": unsilenced_path_ogg})
+        unsilenced_hash = file_hasher({"path": unsilenced_path_mp3})
 
         # old_path = path
         # old_hash = file_hash
-        path = unsilenced_path_ogg
+        path = unsilenced_path_mp3
         file_hash = unsilenced_hash
 
     if audio_backend == "whisper":

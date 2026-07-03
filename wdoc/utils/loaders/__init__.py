@@ -10,7 +10,6 @@ import os
 import re
 import sys
 import time
-import traceback
 from functools import wraps
 from pathlib import Path
 
@@ -88,27 +87,35 @@ def wrapper_load_one_doc(func: Callable) -> Callable:
 
             filetype = kwargs.get("filetype", "unknown")
             exc_type, exc_obj, exc_tb = sys.exc_info()
-            formatted_tb = "\n".join(traceback.format_tb(exc_tb))
-            if "pdf parser" in str(err).lower() and "to parse" in str(err).lower():
-                mess = (
-                    f"Error when loading doc with filetype {filetype}: '{err}'. "
-                    f"Arguments: {kwargs}"
-                )
-            else:
-                mess = (
-                    f"Error when loading doc with filetype {filetype}: '{err}'. "
-                    f"Arguments: {kwargs}"
-                    f"\nLine number: {exc_tb.tb_lineno}"
-                    f"\nFull traceback:\n{formatted_tb}"
-                )
+            # Keep the human-facing message concise. The traceback is shown
+            # exactly once: attached via exc_info on the warn path, or printed by
+            # the re-raise on the crash paths. It used to be embedded in the
+            # message AND re-emitted by logger.exception AND by the re-raise,
+            # stacking three near-identical tracebacks that buried the actual
+            # error (e.g. a single "415 Unsupported Media Type" from a whisper
+            # endpoint) and made the output misleading.
+            is_pdf_parser_err = (
+                "pdf parser" in str(err).lower() and "to parse" in str(err).lower()
+            )
+            mess = (
+                f"Error when loading doc with filetype {filetype}: '{err}'. "
+                f"Arguments: {kwargs}"
+            )
+            if not is_pdf_parser_err:
+                mess += f"\nLine number: {exc_tb.tb_lineno}"
             if loading_failure == "crash":
-                logger.exception(mess)
+                # the re-raise below prints the traceback once, so don't attach
+                # it here too (logger.exception would duplicate it)
+                logger.error(mess)
                 raise
             elif loading_failure == "warn" or env.WDOC_DEBUG:
-                logger.warning(mess)
+                # this path swallows the exception and returns the error string,
+                # so attach the traceback once (compact unless WDOC_DEBUG) to keep
+                # it available for debugging without duplicating it
+                logger.opt(exception=not is_pdf_parser_err).warning(mess)
                 return str(err)
             else:
-                logger.exception(mess)
+                logger.error(mess)
                 raise ValueError(loading_failure) from err
 
     return wrapper

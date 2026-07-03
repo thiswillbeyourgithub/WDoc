@@ -290,14 +290,32 @@ def transcribe_audio_whisper(
                 if whisper_api_key:
                     headers["Authorization"] = f"Bearer {whisper_api_key}"
 
+                # Rewind the file: litellm.transcription above already read
+                # `audio_file` to EOF, so without this seek the fallback would
+                # upload an empty body and the endpoint would answer with a
+                # misleading error (e.g. 415 Unsupported Media Type) that has
+                # nothing to do with the real failure.
+                audio_file.seek(0)
+
                 # Make the request
                 endpoint_url = (
                     env.WDOC_WHISPER_ENDPOINT.rstrip("/") + "/v1/audio/transcriptions"
                 )
-                response = requests.post(
-                    endpoint_url, files=files, data=data, headers=headers
-                )
-                response.raise_for_status()
+                try:
+                    response = requests.post(
+                        endpoint_url, files=files, data=data, headers=headers
+                    )
+                    response.raise_for_status()
+                except Exception as fallback_err:
+                    # Surface both errors: the fallback error is what the endpoint
+                    # returned, but the original litellm error is often the real
+                    # root cause (e.g. an auth/proxy misconfiguration) and would
+                    # otherwise be discarded, leaving a misleading message.
+                    raise Exception(
+                        f"Whisper transcription failed. Direct request to "
+                        f"'{endpoint_url}' raised: {fallback_err}. The initial "
+                        f"litellm.transcription attempt raised: {litellm_err}"
+                    ) from fallback_err
                 transcript = response.json()
 
         t2 = time.time()
