@@ -698,3 +698,51 @@ def test_query_duckduckgo_search():
     assert isinstance(out["final_answer"], str), out
     assert len(out["final_answer"]) > 0, out
     # Don't check the content deeply as requested, just ensure it returns something
+
+
+@pytest.mark.basic
+def test_load_one_doc_error_message_is_concise():
+    """A failing document load must log ONE concise error line, not the error
+    text stapled to a full traceback. The wrapper used to embed the traceback in
+    the message AND re-emit it via logger.exception AND again via the re-raise,
+    stacking three near-identical tracebacks that buried the real error (e.g. a
+    single '415 Unsupported Media Type' from a whisper endpoint). Regression test
+    for that noisy/misleading output."""
+    from loguru import logger
+    from wdoc.utils.loaders import wrapper_load_one_doc
+
+    @wrapper_load_one_doc
+    def _boom(**kwargs):
+        raise ValueError("415 Unsupported Media Type")
+
+    records = []
+    sink_id = logger.add(lambda m: records.append(m.record), level="DEBUG")
+    try:
+        # warn mode swallows the error and returns its string
+        ret = _boom(filetype="local_audio", loading_failure="warn")
+        assert ret == "415 Unsupported Media Type"
+
+        # crash mode re-raises the original exception
+        with pytest.raises(ValueError, match="415 Unsupported Media Type"):
+            _boom(filetype="local_audio", loading_failure="crash")
+    finally:
+        logger.remove(sink_id)
+
+    wrapper_records = [r for r in records if "Error when loading doc" in r["message"]]
+    assert len(wrapper_records) == 2, wrapper_records
+
+    for rec in wrapper_records:
+        # the message itself stays concise: no embedded traceback dump
+        assert "Full traceback:" not in rec["message"], rec["message"]
+        assert "415 Unsupported Media Type" in rec["message"], rec["message"]
+        assert "filetype local_audio" in rec["message"], rec["message"]
+
+    warn_rec = next(r for r in wrapper_records if r["level"].name == "WARNING")
+    crash_rec = next(r for r in wrapper_records if r["level"].name == "ERROR")
+
+    # crash mode leaves the traceback to the re-raise instead of duplicating it
+    # onto the log record
+    assert crash_rec["exception"] is None, crash_rec["exception"]
+    # warn mode keeps the traceback attached exactly once (via exc_info), not
+    # inlined into the message
+    assert warn_rec["exception"] is not None
