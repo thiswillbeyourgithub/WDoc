@@ -746,3 +746,98 @@ def test_load_one_doc_error_message_is_concise():
     # warn mode keeps the traceback attached exactly once (via exc_info), not
     # inlined into the message
     assert warn_rec["exception"] is not None
+
+
+@pytest.mark.basic
+def test_whisper_fallback_rewinds_file(tmp_path, monkeypatch):
+    """When litellm.transcription fails and wdoc falls back to a direct request,
+    it must rewind the audio file first. litellm reads the handle to EOF, so
+    without a seek(0) the fallback uploads an empty body and the endpoint answers
+    with a misleading error (e.g. 415 Unsupported Media Type) unrelated to the
+    real failure. Regression test: the fallback must upload the full file."""
+    import litellm
+    import requests
+
+    from wdoc.utils.loaders import shared_audio
+
+    monkeypatch.setenv("WDOC_WHISPER_API_KEY", "test-key")
+    monkeypatch.setenv("WDOC_WHISPER_ENDPOINT", "https://fake.endpoint/")
+
+    audio_path = tmp_path / "sample.mp3"
+    payload = b"FAKE_AUDIO_BYTES_0123456789"
+    audio_path.write_bytes(payload)
+
+    def fake_transcription(**kwargs):
+        # emulate litellm consuming the file to EOF before failing
+        kwargs["file"].read()
+        raise RuntimeError("litellm boom")
+
+    uploaded = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"text": "ok"}
+
+    def fake_post(url, files=None, data=None, headers=None):
+        uploaded["content"] = files["file"].read()
+        return FakeResponse()
+
+    monkeypatch.setattr(litellm, "transcription", fake_transcription)
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    # call the undecorated function to bypass the joblib disk cache, so the test
+    # actually exercises the code and stays reproducible across runs
+    out = shared_audio.transcribe_audio_whisper.func(
+        audio_path=audio_path,
+        audio_hash="rewind-hash",
+        language=None,
+        prompt=None,
+    )
+
+    assert out == {"text": "ok"}
+    # the crux: the fallback uploaded the whole file, not the empty EOF leftover
+    assert uploaded["content"] == payload
+
+
+@pytest.mark.basic
+def test_whisper_fallback_surfaces_both_errors(tmp_path, monkeypatch):
+    """If the direct-request fallback also fails, the raised error must mention
+    BOTH the endpoint error and the original litellm error, so the real root
+    cause (often an auth/proxy misconfiguration) is not masked by a spurious
+    status code."""
+    import litellm
+    import requests
+
+    from wdoc.utils.loaders import shared_audio
+
+    monkeypatch.setenv("WDOC_WHISPER_API_KEY", "test-key")
+    monkeypatch.setenv("WDOC_WHISPER_ENDPOINT", "https://fake.endpoint/")
+
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"FAKE_AUDIO_BYTES_0123456789")
+
+    def fake_transcription(**kwargs):
+        kwargs["file"].read()
+        raise RuntimeError("original litellm auth failure")
+
+    def fake_post(url, files=None, data=None, headers=None):
+        raise requests.exceptions.HTTPError("415 Unsupported Media Type")
+
+    monkeypatch.setattr(litellm, "transcription", fake_transcription)
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    # call the undecorated function to bypass the joblib disk cache
+    with pytest.raises(Exception) as excinfo:
+        shared_audio.transcribe_audio_whisper.func(
+            audio_path=audio_path,
+            audio_hash="both-errors-hash",
+            language=None,
+            prompt=None,
+        )
+
+    msg = str(excinfo.value)
+    assert "415 Unsupported Media Type" in msg
+    assert "original litellm auth failure" in msg
