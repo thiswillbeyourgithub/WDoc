@@ -841,3 +841,93 @@ def test_whisper_fallback_surfaces_both_errors(tmp_path, monkeypatch):
     msg = str(excinfo.value)
     assert "415 Unsupported Media Type" in msg
     assert "original litellm auth failure" in msg
+
+
+@pytest.mark.basic
+def test_local_audio_unsilence_uploads_mp3_not_ogg(tmp_path, monkeypatch):
+    """The silence-removal path must hand a widely-supported format to the
+    transcriber. It used to re-encode to .ogg, which some OpenAI-compatible
+    whisper endpoints reject with a 415 Unsupported Media Type. Regression test:
+    the file passed to transcribe_audio_whisper must be .mp3 (matching the video
+    and online-media loaders), never .ogg."""
+    import types
+    import uuid
+    from pathlib import Path
+
+    from wdoc.utils.loaders import local_audio
+
+    # a fake waveform whose only meaningful attribute is its sample count
+    class FakeWave:
+        def __init__(self, nsamples):
+            self.shape = (1, nsamples)
+
+    sample_rate = 16000
+    # 20s of audio -> 15s after "silence removal": passes the >10s and
+    # new_dur <= dur assertions in the loader. raising=False because torchaudio
+    # exposes some of these (e.g. sox_effects) only after a lazy submodule import.
+    monkeypatch.setattr(
+        local_audio.torchaudio,
+        "load",
+        lambda *a, **k: (FakeWave(20 * sample_rate), sample_rate),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        local_audio.torchaudio,
+        "sox_effects",
+        types.SimpleNamespace(
+            apply_effects_tensor=lambda *a, **k: (
+                FakeWave(15 * sample_rate),
+                sample_rate,
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        local_audio.torchaudio, "save", lambda *a, **k: None, raising=False
+    )
+
+    # no-op ffmpeg chain: ffmpeg.input(...).output(...).run()
+    class _Chain:
+        def output(self, *a, **k):
+            return self
+
+        def run(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(local_audio.ffmpeg, "input", lambda *a, **k: _Chain())
+    monkeypatch.setattr(local_audio, "file_hasher", lambda *a, **k: "fakehash")
+
+    captured = {}
+
+    def fake_transcribe(audio_path, audio_hash, language, prompt):
+        captured["audio_path"] = Path(audio_path)
+        return {
+            "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
+            "duration": 15.0,
+            "language": "en",
+        }
+
+    monkeypatch.setattr(local_audio, "transcribe_audio_whisper", fake_transcribe)
+    monkeypatch.setattr(
+        local_audio,
+        "convert_verbose_json_to_timestamped_text",
+        lambda content: "hello",
+    )
+
+    audio_in = tmp_path / "input.wav"
+    audio_in.write_bytes(b"not-really-audio")
+
+    docs = local_audio.load_local_audio(
+        path=audio_in,
+        # unique hash so the joblib doc-loaders cache always misses (reproducible)
+        file_hash=uuid.uuid4().hex,
+        audio_backend="whisper",
+        loaders_temp_dir=tmp_path,
+        audio_unsilence=True,
+    )
+
+    assert "audio_path" in captured, "transcribe_audio_whisper was never called"
+    assert captured["audio_path"].suffix == ".mp3", captured["audio_path"]
+    assert captured["audio_path"].suffix != ".ogg"
+    assert len(docs) == 1
+    assert docs[0].page_content == "hello"
