@@ -1,10 +1,15 @@
-"""wdoc-specific model metadata registered with LiteLLM."""
+"""Add model metadata that is not yet available in LiteLLM."""
 
 from typing import Any, Literal
+
+from loguru import logger
 
 
 MINIMAX_PROVIDER = "minimax"
 
+# Endpoint sources:
+# https://platform.minimax.io/docs
+# https://platform.minimaxi.com/docs
 MINIMAX_ENDPOINTS = {
     "global_en": {
         "openai_base_url": "https://api.minimax.io/v1",
@@ -16,6 +21,9 @@ MINIMAX_ENDPOINTS = {
     },
 }
 
+# Model metadata sources:
+# https://platform.minimax.io/docs/api-reference/api-overview
+# https://platform.minimaxi.com/docs/api-reference/api-overview
 MINIMAX_MODELS = {
     "minimax/MiniMax-M3": {
         "litellm_provider": MINIMAX_PROVIDER,
@@ -61,8 +69,23 @@ def get_minimax_api_base(
         ) from err
 
 
-def register_wdoc_models(litellm: Any) -> None:
-    """Register wdoc's model recipes in LiteLLM's cost and provider catalogs."""
-    litellm.register_model(MINIMAX_MODELS)
+def _add_extra_models_metadata(litellm: Any) -> None:
+    models_to_add = {
+        model_id: metadata
+        for model_id, metadata in MINIMAX_MODELS.items()
+        if model_id not in litellm.model_cost
+    }
+    if not models_to_add:
+        return
+
+    litellm.register_model(models_to_add)
     provider_models = litellm.models_by_provider.setdefault(MINIMAX_PROVIDER, set())
-    provider_models.update(MINIMAX_MODELS)
+    provider_models.update(models_to_add)
+
+
+def add_extra_models_metadata(litellm: Any) -> None:
+    """Add missing model metadata without preventing wdoc from starting."""
+    try:
+        _add_extra_models_metadata(litellm)
+    except Exception as err:
+        logger.warning(f"Could not add extra LiteLLM model metadata: {err}")
