@@ -28,6 +28,14 @@ wdoc.utils.loaders.json\_dict module
    :show-inheritance:
    :undoc-members:
 
+wdoc.utils.loaders.karakeep module
+----------------------------------
+
+.. automodule:: wdoc.utils.loaders.karakeep
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 wdoc.utils.loaders.local\_audio module
 --------------------------------------
 
@@ -152,6 +160,14 @@ wdoc.utils.loaders.youtube module
 ---------------------------------
 
 .. automodule:: wdoc.utils.loaders.youtube
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+wdoc.utils.loaders.zotero module
+--------------------------------
+
+.. automodule:: wdoc.utils.loaders.zotero
    :members:
    :show-inheritance:
    :undoc-members:

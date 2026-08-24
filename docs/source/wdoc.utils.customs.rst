@@ -4,6 +4,14 @@ wdoc.utils.customs package
 Submodules
 ----------
 
+wdoc.utils.customs.add\_extra\_litellm\_models\_metadata module
+---------------------------------------------------------------
+
+.. automodule:: wdoc.utils.customs.add_extra_litellm_models_metadata
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 wdoc.utils.customs.binary\_faiss\_vectorstore module
 ----------------------------------------------------
 
