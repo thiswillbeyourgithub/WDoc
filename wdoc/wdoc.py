@@ -32,6 +32,9 @@ from wdoc.utils.logger import (
 )
 
 from wdoc.utils.batch_file_loader import batch_load_doc
+from wdoc.utils.customs.add_extra_litellm_models_metadata import (
+    add_extra_models_metadata,
+)
 from wdoc.utils.env import env, is_out_piped
 from wdoc.utils.errors import (
     NoDocumentsAfterLLMEvalFiltering,
@@ -119,6 +122,8 @@ class wdoc:
         This docstring is dynamically updated with the content of wdoc/docs/help.md
         """
         import litellm
+
+        add_extra_models_metadata(litellm)
 
         if version:
             print(self.VERSION)
